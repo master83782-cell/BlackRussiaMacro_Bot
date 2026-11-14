@@ -3,6 +3,7 @@ import os
 import csv
 import io
 from html import escape
+from aiohttp import web  # ДОБАВЛЕНО для работы веб-сервера на Render
 
 import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -237,6 +238,13 @@ async def init_db():
 
         async with db.execute("PRAGMA table_info(users)") as cur:
             user_cols = [row[1] for row in await cur.fetchall()]
+        
+        # --- ИСПРАВЛЕНИЕ: Добавлена проверка колонки joined_at ---
+        if "joined_at" not in user_cols:
+            await db.execute("ALTER TABLE users ADD COLUMN joined_at TEXT")
+            await db.execute("UPDATE users SET joined_at = CURRENT_TIMESTAMP WHERE joined_at IS NULL")
+        # -----------------------------------------------------------
+
         if "last_seen" not in user_cols:
             await db.execute("ALTER TABLE users ADD COLUMN last_seen TEXT")
             await db.execute("UPDATE users SET last_seen = joined_at WHERE last_seen IS NULL")
@@ -1736,6 +1744,7 @@ async def stats(callback: CallbackQuery):
     )
     await callback.answer()
 
+# ---------- ЗАПУСК ----------
 async def main():
     await init_db()
     await load_admins()
@@ -1744,6 +1753,21 @@ async def main():
     router.message.outer_middleware(BanMiddleware())
     router.callback_query.outer_middleware(BanMiddleware())
     dp.include_router(router)
+    
+    # --- ДОБАВЛЕНО: Веб-сервер для Render ---
+    async def handle(request):
+        return web.Response(text="Bot is running!")
+    
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Web server started on port {port}")
+    # ---------------------------------------
+
     print("Bot started. Stop with Ctrl+C.")
     try:
         await dp.start_polling(bot)
