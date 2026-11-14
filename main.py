@@ -3,13 +3,12 @@ import os
 import csv
 import io
 from html import escape
-from aiohttp import web  # ДОБАВЛЕНО: веб-сервер для Render
 
 import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest  # ДОБАВЛЕНО: ошибка BadRequest
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -62,13 +61,6 @@ def is_superadmin(user_id: int) -> bool:
 def get_admin_role(user_id: int):
     return ADMIN_CACHE.get(user_id)
 
-# ДОБАВЛЕНО: безопасный ответ на кнопки, чтобы не было ошибки "query is too old"
-async def safe_answer(callback: CallbackQuery, text: str = None, show_alert: bool = False):
-    try:
-        await callback.answer(text=text, show_alert=show_alert)
-    except TelegramBadRequest:
-        pass
-
 router = Router()
 CATEGORIES = {
     "bluestacks": "BlueStacks",
@@ -99,6 +91,9 @@ class AddChannel(StatesGroup):
     url = State()
 
 class UserManagement(StatesGroup):
+    search = State()
+    ban_reason = State()
+    ban_duration = State()
     ban_id = State()
     ban_username = State()
     unban_id = State()
@@ -219,6 +214,15 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_items_kind ON items(kind)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_items_kind_cat ON items(kind, category)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+        await db.execute("CREATE TABLE IF NOT EXISTS user_events (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,event_type TEXT NOT NULL,item_id INTEGER,details TEXT DEFAULT '',created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        await db.execute("CREATE TABLE IF NOT EXISTS admin_actions (id INTEGER PRIMARY KEY AUTOINCREMENT,admin_id INTEGER NOT NULL,action TEXT NOT NULL,target_user_id INTEGER,details TEXT DEFAULT '',created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        await db.execute("CREATE TABLE IF NOT EXISTS ban_history (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,admin_id INTEGER NOT NULL,action TEXT NOT NULL,reason TEXT DEFAULT '',expires_at TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_events_user_time ON user_events(user_id,created_at)")
+        async with db.execute("PRAGMA table_info(banned_users)") as cur:
+            bc=[r[1] for r in await cur.fetchall()]
+        if "expires_at" not in bc:
+            await db.execute("ALTER TABLE banned_users ADD COLUMN expires_at TEXT")
+
 
         # Миграция колонок для старых БД
         async with db.execute("PRAGMA table_info(items)") as cur:
@@ -313,16 +317,42 @@ async def unban_user(user_id: int) -> bool:
 class BanMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user = getattr(event, "from_user", None)
-        if user and not is_admin(user.id):
-            ban = await get_ban_info(user.id)
-            if ban:
-                reason = ban["reason"] or "Причина не указана"
-                notice = f"⛔ Доступ к боту ограничен администратором.\nПричина: {escape(reason)}"
-                if isinstance(event, Message):
-                    await event.answer(notice)
-                elif isinstance(event, CallbackQuery):
-                    await safe_answer(event, "⛔ Доступ к боту ограничен.", show_alert=True)
-                return
+        if user:
+            await record_user(user)
+            action = None
+            if isinstance(event, CallbackQuery):
+                raw = (event.data or "").strip()
+                if raw == "home": action = "Главное меню"
+                elif raw == "checksub": action = "Проверка подписки"
+                elif raw.startswith("tab:"):
+                    k = raw.split(":", 1)[1]
+                    action = f"Раздел: {KINDS.get(k, {}).get('plural', k)}"
+                elif raw.startswith("tabcat:"):
+                    p = raw.split(":")
+                    if len(p) >= 3: action = f"Категория: {CATEGORIES.get(p[2], p[2])}"
+                elif raw.startswith("viewitem:"): action = "Открыл карточку материала"
+            elif isinstance(event, Message) and event.text:
+                t = event.text.strip()
+                if t == "/start": action = "Запуск бота"
+                elif t in [k["reply"] for k in KINDS.values()]: action = f"Раздел: {t}"
+            if action and not is_admin(user.id):
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("INSERT INTO user_events(user_id,event_type,details) VALUES(?,?,?)",
+                                     (user.id, "click", action[:500]))
+                    await db.commit()
+            if not is_admin(user.id):
+                ban = await get_ban_info(user.id)
+                if ban and ban["expires_at"]:
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute("DELETE FROM banned_users WHERE user_id=? AND expires_at <= CURRENT_TIMESTAMP",(user.id,))
+                        await db.commit()
+                    ban = await get_ban_info(user.id)
+                if ban:
+                    reason = ban["reason"] or "Причина не указана"
+                    notice = f"⛔ Доступ к боту ограничен администратором.\\nПричина: {escape(reason)}"
+                    if isinstance(event, Message): await event.answer(notice)
+                    elif isinstance(event, CallbackQuery): await event.answer("⛔ Доступ к боту ограничен.", show_alert=True)
+                    return
         return await handler(event, data)
 
 async def get_active_channels():
@@ -424,6 +454,10 @@ async def send_item_view(bot: Bot, chat_id: int, item_id: int):
         await bot.send_message(chat_id, "Элемент не найден.")
         return
     kind = item["kind"]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO user_events(user_id,event_type,item_id,details) VALUES(?,?,?,?)",(chat_id,"download",item_id,item["title"]))
+        await db.execute("INSERT INTO user_events(user_id,event_type,item_id,details) VALUES(?,?,?,?)",(chat_id,"open_item",item_id,f"Открыл материал: {item['title']}"))
+        await db.commit()
 
     if item["video_file_id"]:
         try:
@@ -488,7 +522,7 @@ async def check_subscription(callback: CallbackQuery, bot: Bot):
     if await is_subscribed(bot, callback.from_user.id):
         await callback.message.answer("✅ Подписка подтверждена!", reply_markup=kb_home())
     else:
-        await safe_answer(callback, "Не вижу подписку на все каналы. Подпишись и попробуй снова.", show_alert=True)
+        await callback.answer("Не вижу подписку на все каналы. Подпишись и попробуй снова.", show_alert=True)
 
 @router.callback_query(F.data == "home")
 async def home(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -497,7 +531,7 @@ async def home(callback: CallbackQuery, bot: Bot, state: FSMContext):
         await prompt_subscription(callback)
     else:
         await callback.message.answer("Выбери раздел:", reply_markup=kb_home())
-    await safe_answer(callback)
+    await callback.answer()
 
 # ---------- Поддержка ----------
 @router.message(StateFilter(None), Command("support"))
@@ -536,14 +570,14 @@ async def support_send(message: Message, state: FSMContext, bot: Bot):
 
 @router.callback_query(F.data.startswith("sup_reply:"))
 async def sup_reply_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id): return await safe_answer(callback, "Нет доступа.", show_alert=True)
+    if not is_admin(callback.from_user.id): return await callback.answer("Нет доступа.", show_alert=True)
     try: target_id = int(callback.data.split(":")[1])
-    except: return await safe_answer(callback, "Ошибка.", show_alert=True)
+    except: return await callback.answer("Ошибка.", show_alert=True)
     await state.clear()
     await state.update_data(sup_reply_target=target_id)
     await state.set_state(SupportReply.text)
     await callback.message.answer(f"✏️ Введи ответ для пользователя <code>{target_id}</code>:")
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.message(SupportReply.text)
 async def sup_reply_send(message: Message, state: FSMContext, bot: Bot):
@@ -584,7 +618,7 @@ async def tab_message(message: Message, bot: Bot):
 @router.callback_query(F.data.startswith("tab:"))
 async def tab_cb(callback: CallbackQuery, bot: Bot):
     kind = callback.data.split(":", 1)[1]
-    if kind not in KINDS: return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if kind not in KINDS: return await callback.answer("Ошибка.", show_alert=True)
     if not await is_subscribed(bot, callback.from_user.id):
         await prompt_subscription(callback)
     else:
@@ -592,44 +626,44 @@ async def tab_cb(callback: CallbackQuery, bot: Bot):
             await callback.message.answer(f"{KINDS[kind]['emoji']} {KINDS[kind]['plural']} — выбери категорию:", reply_markup=kb_tab_categories(kind))
         else:
             await send_tab_flat(callback, kind)
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("tabcat:"))
 async def tabcat_cb(callback: CallbackQuery, bot: Bot):
     parts = callback.data.split(":")
-    if len(parts) < 3: return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if len(parts) < 3: return await callback.answer("Ошибка.", show_alert=True)
     kind, category = parts[1], parts[2]
     if not await is_subscribed(bot, callback.from_user.id):
         await prompt_subscription(callback)
-        await safe_answer(callback)
+        await callback.answer()
         return
     if kind == "macro" and category in CATEGORIES: await send_tab_category(callback, kind, category)
     else: await send_tab_flat(callback, kind)
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("viewitem:"))
 async def viewitem_cb(callback: CallbackQuery, bot: Bot):
     try: item_id = int(callback.data.split(":")[1])
-    except: return await safe_answer(callback, "Ошибка.", show_alert=True)
+    except: return await callback.answer("Ошибка.", show_alert=True)
     if not await is_subscribed(bot, callback.from_user.id): await prompt_subscription(callback)
     else: await send_item_view(bot, callback.from_user.id, item_id)
-    await safe_answer(callback)
+    await callback.answer()
 
 # ---------- Админка: общее ----------
 @router.callback_query(F.data == "adm:open")
 async def admin_open(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id): return await safe_answer(callback, "Нет доступа.", show_alert=True)
+    if not is_admin(callback.from_user.id): return await callback.answer("Нет доступа.", show_alert=True)
     await state.clear()
     role = get_admin_role(callback.from_user.id)
     role_name = "👑 Суперадмин" if role == "superadmin" else "🛡 Модератор"
     await callback.message.answer(f"🔐 Панель администратора\nРоль: {role_name}", reply_markup=kb_admin(callback.from_user.id))
-    await safe_answer(callback)
+    await callback.answer()
 
 # ---------- Восстановление файлов ----------
 @router.callback_query(F.data == "adm:restore_files")
 async def restore_files(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
-    await safe_answer(callback, "⏳ Ищу файлы…")
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
+    await callback.answer("⏳ Ищу файлы…")
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='macros'") as cur:
             if not await cur.fetchone(): return await callback.message.answer("Старая таблица 'macros' не найдена.")
@@ -660,11 +694,11 @@ async def restore_files(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("adm:kind:"))
 async def admin_kind(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id): return await safe_answer(callback, "Нет доступа.", show_alert=True)
+    if not is_admin(callback.from_user.id): return await callback.answer("Нет доступа.", show_alert=True)
     kind = callback.data.split(":")[2]
     await state.clear()
     await callback.message.answer(f"{KINDS[kind]['emoji']} <b>{KINDS[kind]['plural']}</b>\n\nЧто сделать?", reply_markup=kb_admin_kind(kind))
-    await safe_answer(callback)
+    await callback.answer()
 
 # ---------- Рассылка ----------
 async def do_broadcast(bot: Bot, from_chat_id: int, message_id: int):
@@ -689,11 +723,11 @@ async def do_broadcast(bot: Bot, from_chat_id: int, message_id: int):
 
 @router.callback_query(F.data == "adm:broadcast")
 async def broadcast_start(callback: CallbackQuery, state: FSMContext):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Только для суперадминов.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Только для суперадминов.", show_alert=True)
     await state.clear()
     await state.set_state(Broadcast.message)
     await callback.message.answer("📢 <b>Рассылка</b>\n\nОтправь сообщение для всех пользователей.\nДля отмены: /cancel")
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.message(Broadcast.message)
 async def broadcast_preview(message: Message, state: FSMContext):
@@ -709,25 +743,25 @@ async def broadcast_preview(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "broadcast:confirm")
 async def broadcast_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     data = await state.get_data()
     await state.clear()
     await callback.message.answer("📤 Рассылка запущена…")
     success, failed = await do_broadcast(bot, data.get("broadcast_chat_id"), data.get("broadcast_message_id"))
     await callback.message.answer(f"✅ Рассылка завершена.\nОтправлено: {success}\nНе доставлено: {failed}", reply_markup=kb_admin(callback.from_user.id))
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data == "broadcast:cancel")
 async def broadcast_cancel(callback: CallbackQuery, state: FSMContext):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     await state.clear()
     await callback.message.answer("❌ Рассылка отменена.", reply_markup=kb_admin(callback.from_user.id))
-    await safe_answer(callback)
+    await callback.answer()
 
 # ---------- Добавление контента ----------
 @router.callback_query(F.data.startswith("adm:add:"))
 async def admin_add_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id): return await safe_answer(callback, "Нет доступа.", show_alert=True)
+    if not is_admin(callback.from_user.id): return await callback.answer("Нет доступа.", show_alert=True)
     kind = callback.data.split(":")[2]
     await state.clear()
     await state.update_data(kind=kind)
@@ -738,17 +772,17 @@ async def admin_add_start(callback: CallbackQuery, state: FSMContext):
         await state.update_data(category="")
         await state.set_state(AddItem.title)
         await callback.message.answer(f"Введи название для «{KINDS[kind]['name']}»:")
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(AddItem.category, F.data.startswith("addcat:"))
 async def add_category(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id): return await safe_answer(callback, "Нет доступа.", show_alert=True)
+    if not is_admin(callback.from_user.id): return await callback.answer("Нет доступа.", show_alert=True)
     parts = callback.data.split(":")
     kind, category = parts[1], parts[2]
     await state.update_data(category=category, kind=kind)
     await state.set_state(AddItem.title)
     await callback.message.answer(f"Введи название для «{KINDS[kind]['name']}»:")
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.message(AddItem.title)
 async def add_title(message: Message, state: FSMContext):
@@ -873,7 +907,7 @@ async def add_guide(message: Message, state: FSMContext):
 # ---------- Списки / Удаление / Редактирование ----------
 @router.callback_query(F.data.startswith("adm:list:"))
 async def admin_list(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id): return await safe_answer(callback, "Нет доступа.", show_alert=True)
+    if not is_admin(callback.from_user.id): return await callback.answer("Нет доступа.", show_alert=True)
     kind = callback.data.split(":")[2]
     items = await list_items(kind)
     if not items: text = f"{KINDS[kind]['emoji']} {KINDS[kind]['plural']} — пока пусто."
@@ -885,46 +919,46 @@ async def admin_list(callback: CallbackQuery):
             lines.append(f"#{it['id']} — {prefix}{escape(it['title'])}")
         text = "\n".join(lines)
     await callback.message.answer(text, reply_markup=kb_admin_kind(kind))
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("adm:del:"))
 async def admin_delete_list(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id): return await safe_answer(callback, "Нет доступа.", show_alert=True)
+    if not is_admin(callback.from_user.id): return await callback.answer("Нет доступа.", show_alert=True)
     kind = callback.data.split(":")[2]
     items = await list_items(kind)
     buttons = [[InlineKeyboardButton(text=f"🗑 #{it['id']} {it['title']}"[:60], callback_data=f"delitem:{it['id']}")] for it in items]
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm:kind:{kind}")])
     await callback.message.answer("Выбери для удаления:" if items else "Пусто.", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("delitem:"))
 async def delete_item(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id): return await safe_answer(callback, "Нет доступа.", show_alert=True)
+    if not is_admin(callback.from_user.id): return await callback.answer("Нет доступа.", show_alert=True)
     item_id = int(callback.data.split(":")[1])
     item = await get_item(item_id)
-    if not item: return await safe_answer(callback, "Не найдено.", show_alert=True)
+    if not item: return await callback.answer("Не найдено.", show_alert=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM items WHERE id=?", (item_id,))
         await db.commit()
     await callback.message.answer(f"✅ Удалено #{item_id}.", reply_markup=kb_admin_kind(item["kind"]))
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("adm:edit:"))
 async def admin_edit_list(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id): return await safe_answer(callback, "Нет доступа.", show_alert=True)
+    if not is_admin(callback.from_user.id): return await callback.answer("Нет доступа.", show_alert=True)
     kind = callback.data.split(":")[2]
     items = await list_items(kind)
     buttons = [[InlineKeyboardButton(text=f"✏️ #{it['id']} {it['title']}"[:60], callback_data=f"edititem:{it['id']}")] for it in items]
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm:kind:{kind}")])
     await callback.message.answer("Выбери для изменения:" if items else "Пусто.", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("edititem:"))
 async def edit_item_choose(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id): return await safe_answer(callback, "Нет доступа.", show_alert=True)
+    if not is_admin(callback.from_user.id): return await callback.answer("Нет доступа.", show_alert=True)
     item_id = int(callback.data.split(":")[1])
     item = await get_item(item_id)
-    if not item: return await safe_answer(callback, "Не найдено.", show_alert=True)
+    if not item: return await callback.answer("Не найдено.", show_alert=True)
     kind = item["kind"]
     await state.update_data(edit_item_id=item_id, edit_kind=kind)
     
@@ -943,22 +977,22 @@ async def edit_item_choose(callback: CallbackQuery, state: FSMContext):
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm:kind:{kind}")])
     
     await callback.message.answer("Что изменить?", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("editfield:"))
 async def edit_field(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id): return await safe_answer(callback, "Нет доступа.", show_alert=True)
+    if not is_admin(callback.from_user.id): return await callback.answer("Нет доступа.", show_alert=True)
     parts = callback.data.split(":")
     item_id = int(parts[1])
     field = parts[2]
     item = await get_item(item_id)
-    if not item: return await safe_answer(callback, "Не найдено.", show_alert=True)
+    if not item: return await callback.answer("Не найдено.", show_alert=True)
     await state.update_data(edit_item_id=item_id, edit_field=field, edit_kind=item["kind"])
     await state.set_state(EditItem.value)
     if field == "video": await callback.message.answer("Отправь новое видео (или /skip).")
     elif field == "apk": await callback.message.answer("Отправь новый APK (или /skip).")
     else: await callback.message.answer("Отправь новое значение текстом.")
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.message(EditItem.value, F.video)
 async def edit_value_video(message: Message, state: FSMContext):
@@ -1029,7 +1063,7 @@ async def edit_value(message: Message, state: FSMContext):
 # ---------- Каналы ----------
 @router.callback_query(F.data == "adm:channels")
 async def channels_menu(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Только для суперадминов.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Только для суперадминов.", show_alert=True)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM channels ORDER BY id") as cur:
@@ -1045,11 +1079,11 @@ async def channels_menu(callback: CallbackQuery):
         [InlineKeyboardButton(text="⬅️ В админку", callback_data="adm:open")],
     ])
     await callback.message.answer("Каналы подписки (нажми, чтобы включить/выключить):", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data == "ch:check_perms")
 async def check_channel_perms(callback: CallbackQuery, bot: Bot):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     channels = await get_active_channels()
     if not channels: return await callback.message.answer("Нет активных каналов.")
     msg = "🩺 <b>Проверка прав бота в каналах:</b>\n\n"
@@ -1062,25 +1096,25 @@ async def check_channel_perms(callback: CallbackQuery, bot: Bot):
             msg += f"❌ {ch['title']} (<code>{ch['chat_id']}</code>) — Ошибка: {escape(str(e))}\n"
     msg += "\n⚠️ <b>Внимание!</b> Бот обязан быть администратором для проверки подписки."
     await callback.message.answer(msg)
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("togglech:"))
 async def toggle_channel(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     channel_id = int(callback.data.split(":")[1])
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE channels SET active=CASE WHEN active=1 THEN 0 ELSE 1 END WHERE id=?", (channel_id,))
         await db.commit()
-    await safe_answer(callback, "Статус канала изменён.")
+    await callback.answer("Статус канала изменён.")
     await channels_menu(callback)
 
 @router.callback_query(F.data == "ch:add")
 async def channel_add_start(callback: CallbackQuery, state: FSMContext):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     await state.clear()
     await state.set_state(AddChannel.title)
     await callback.message.answer("Введи название канала:")
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.message(AddChannel.title)
 async def channel_add_title(message: Message, state: FSMContext):
@@ -1110,31 +1144,36 @@ async def channel_add_url(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "ch:delete_list")
 async def channel_delete_list(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT id,title FROM channels ORDER BY id") as cur: rows = await cur.fetchall()
     buttons = [[InlineKeyboardButton(text=f"🗑 #{r['id']} {r['title']}"[:60], callback_data=f"delch:{r['id']}")] for r in rows]
     buttons.append([InlineKeyboardButton(text="⬅️ К каналам", callback_data="adm:channels")])
     await callback.message.answer("Выбери канал для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("delch:"))
 async def channel_delete(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     channel_id = int(callback.data.split(":")[1])
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM channels WHERE id=?", (channel_id,))
         await db.commit()
-    await safe_answer(callback, "Канал удалён.")
+    await callback.answer("Канал удалён.")
     await channels_menu(callback)
 
 # ---------- Пользователи ----------
 @router.callback_query(F.data == "adm:users")
 async def users_menu(callback: CallbackQuery, state: FSMContext):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Только для суперадминов.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Только для суперадминов.", show_alert=True)
     await state.clear()
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Дашборд", callback_data="ux:dashboard")],
+        [InlineKeyboardButton(text="🔎 Глобальный поиск", callback_data="ux:search")],
+        [InlineKeyboardButton(text="👥 Все пользователи", callback_data="ux:list:0")],
+        [InlineKeyboardButton(text="📥 Полная выписка CSV", callback_data="mass:export")],
+        [InlineKeyboardButton(text="📜 История действий", callback_data="ux:logs")],
         [InlineKeyboardButton(text="📋 Последние пользователи", callback_data="users:list")],
         [InlineKeyboardButton(text="🚫 Забанить по ID", callback_data="users:ban"), InlineKeyboardButton(text="🚫 Забанить по @username", callback_data="users:ban_username")],
         [InlineKeyboardButton(text="✅ Разбанить по ID", callback_data="users:unban"), InlineKeyboardButton(text="⛔ Список забаненных", callback_data="users:banned")],
@@ -1142,7 +1181,7 @@ async def users_menu(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="⬅️ В админку", callback_data="adm:open")],
     ])
     await callback.message.answer("👥 <b>Управление пользователями</b>", reply_markup=keyboard)
-    await safe_answer(callback)
+    await callback.answer()
 
 async def build_user_profile(target_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1165,12 +1204,12 @@ async def build_user_profile(target_id: int):
 
 @router.callback_query(F.data.startswith("user_profile:"))
 async def user_profile(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     target_id = int(callback.data.split(":")[1])
     text, markup = await build_user_profile(target_id)
-    if not text: return await safe_answer(callback, "Не найден.", show_alert=True)
+    if not text: return await callback.answer("Не найден.", show_alert=True)
     await callback.message.answer(text, reply_markup=markup)
-    await safe_answer(callback)
+    await callback.answer()
 
 async def _refresh_profile(callback: CallbackQuery, target_id: int):
     text, markup = await build_user_profile(target_id)
@@ -1180,34 +1219,34 @@ async def _refresh_profile(callback: CallbackQuery, target_id: int):
 
 @router.callback_query(F.data.startswith("user_ban:"))
 async def user_ban_quick(callback: CallbackQuery, bot: Bot):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     target_id = int(callback.data.split(":")[1])
-    if is_admin(target_id): return await safe_answer(callback, "Нельзя забанить админа.", show_alert=True)
+    if is_admin(target_id): return await callback.answer("Нельзя забанить админа.", show_alert=True)
     await ban_user(target_id, callback.from_user.id)
     try: await bot.send_message(target_id, "⛔ Ваш доступ ограничен.")
     except: pass
-    await safe_answer(callback, "Забанен.")
+    await callback.answer("Забанен.")
     await _refresh_profile(callback, target_id)
 
 @router.callback_query(F.data.startswith("user_unban:"))
 async def user_unban_quick(callback: CallbackQuery, bot: Bot):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     target_id = int(callback.data.split(":")[1])
     await unban_user(target_id)
     try: await bot.send_message(target_id, "✅ Доступ восстановлен.")
     except: pass
-    await safe_answer(callback, "Разбанен.")
+    await callback.answer("Разбанен.")
     await _refresh_profile(callback, target_id)
 
 @router.callback_query(F.data.startswith("user_msg:"))
 async def user_msg_start(callback: CallbackQuery, state: FSMContext):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     target_id = int(callback.data.split(":")[1])
     await state.clear()
     await state.update_data(msg_target=target_id)
     await state.set_state(UserMessage.text)
     await callback.message.answer(f"✉️ Введи сообщение для <code>{target_id}</code>.\nДля отмены: /cancel")
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.message(UserMessage.text)
 async def user_msg_send(message: Message, state: FSMContext, bot: Bot):
@@ -1224,22 +1263,22 @@ async def user_msg_send(message: Message, state: FSMContext, bot: Bot):
 
 @router.callback_query(F.data == "users:list")
 async def users_list(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT user_id, username, first_name FROM users ORDER BY joined_at DESC LIMIT 20") as cur: rows = await cur.fetchall()
     buttons = [[InlineKeyboardButton(text=f"👤 {r['first_name'] or '—'} (@{r['username'] or '—'})"[:60], callback_data=f"user_profile:{r['user_id']}")] for r in rows]
     buttons.append([InlineKeyboardButton(text="⬅️ К пользователям", callback_data="adm:users")])
     await callback.message.answer("📋 <b>Последние пользователи:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data == "users:ban")
 async def user_ban_start(callback: CallbackQuery, state: FSMContext):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     await state.clear()
     await state.set_state(UserManagement.ban_id)
     await callback.message.answer("Введи ID для бана.")
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.message(UserManagement.ban_id)
 async def user_ban_finish(message: Message, state: FSMContext, bot: Bot):
@@ -1248,6 +1287,9 @@ async def user_ban_finish(message: Message, state: FSMContext, bot: Bot):
     except: return await message.answer("Нужен ID.")
     if is_admin(target_id): return await message.answer("Нельзя забанить админа.")
     await ban_user(target_id, message.from_user.id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO ban_history(user_id,admin_id,action,reason) VALUES(?,?,'ban','')",(target_id,message.from_user.id)); await db.commit()
+    await audit_admin(message.from_user.id,"ban",target_id,"permanent")
     try: await bot.send_message(target_id, "⛔ Доступ ограничен.")
     except: pass
     await state.clear()
@@ -1255,11 +1297,11 @@ async def user_ban_finish(message: Message, state: FSMContext, bot: Bot):
 
 @router.callback_query(F.data == "users:ban_username")
 async def user_ban_username_start(callback: CallbackQuery, state: FSMContext):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     await state.clear()
     await state.set_state(UserManagement.ban_username)
     await callback.message.answer("Введи @username для бана.")
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.message(UserManagement.ban_username)
 async def user_ban_username_finish(message: Message, state: FSMContext, bot: Bot):
@@ -1272,6 +1314,9 @@ async def user_ban_username_finish(message: Message, state: FSMContext, bot: Bot
     target_id = row["user_id"]
     if is_admin(target_id): return await message.answer("Нельзя забанить админа.")
     await ban_user(target_id, message.from_user.id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO ban_history(user_id,admin_id,action,reason) VALUES(?,?,'ban','')",(target_id,message.from_user.id)); await db.commit()
+    await audit_admin(message.from_user.id,"ban",target_id,"permanent")
     try: await bot.send_message(target_id, "⛔ Доступ ограничен.")
     except: pass
     await state.clear()
@@ -1279,26 +1324,35 @@ async def user_ban_username_finish(message: Message, state: FSMContext, bot: Bot
 
 @router.callback_query(F.data == "users:unban")
 async def user_unban_start(callback: CallbackQuery, state: FSMContext):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     await state.clear()
     await state.set_state(UserManagement.unban_id)
     await callback.message.answer("Введи ID для разбана.")
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.message(UserManagement.unban_id)
 async def user_unban_finish(message: Message, state: FSMContext, bot: Bot):
     if not is_superadmin(message.from_user.id): return await state.clear()
-    try: target_id = int((message.text or "").strip())
-    except: return await message.answer("Нужен ID.")
-    if await unban_user(target_id):
-        try: await bot.send_message(target_id, "✅ Доступ восстановлен.")
+    raw=(message.text or "").strip()
+    if raw.lstrip("@").isdigit(): target_id=int(raw)
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT user_id FROM users WHERE LOWER(username)=LOWER(?)",(raw.lstrip("@"),)) as cur: found=await cur.fetchone()
+        if not found: return await message.answer("Пользователь не найден.")
+        target_id=found[0]
+    changed=await unban_user(target_id)
+    if changed:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT INTO ban_history(user_id,admin_id,action) VALUES(?,?,'unban')",(target_id,message.from_user.id)); await db.commit()
+        await audit_admin(message.from_user.id,"unban",target_id)
+        try: await bot.send_message(target_id,"✅ Доступ восстановлен.")
         except: pass
     await state.clear()
-    await message.answer("✅ Разбанен.", reply_markup=kb_admin(message.from_user.id))
+    await message.answer("✅ Разбан выполнен." if changed else "Пользователь не был забанен.",reply_markup=kb_admin(message.from_user.id))
 
 @router.callback_query(F.data == "users:banned")
 async def banned_users_list(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT user_id, reason, banned_at FROM banned_users ORDER BY banned_at DESC LIMIT 50") as cur: rows = await cur.fetchall()
@@ -1306,11 +1360,11 @@ async def banned_users_list(callback: CallbackQuery):
     lines = ["⛔ <b>Забаненные:</b>"]
     for row in rows: lines.append(f"• <code>{row['user_id']}</code> — {escape(row['reason'] or 'без причины')}")
     await callback.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:users")]]))
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data == "users:mass")
 async def mass_menu(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM banned_users") as cur: banned_count = (await cur.fetchone())[0]
         async with db.execute("SELECT COUNT(*) FROM users WHERE last_seen < datetime('now', '-30 days')") as cur: inactive_count = (await cur.fetchone())[0]
@@ -1321,20 +1375,20 @@ async def mass_menu(callback: CallbackQuery):
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:users")],
     ])
     await callback.message.answer(f"⚙️ <b>Массовые действия</b>\nЗабанено: {banned_count}\nНеактивных: {inactive_count}", reply_markup=keyboard)
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data == "mass:unban_all")
 async def mass_unban_all(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM banned_users")
         await db.commit()
     await callback.message.answer("✅ Все разбанены.", reply_markup=kb_admin(callback.from_user.id))
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data == "mass:cleanup")
 async def mass_cleanup(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     admin_ids = list(ADMIN_CACHE.keys())
     async with aiosqlite.connect(DB_PATH) as db:
         if admin_ids:
@@ -1344,27 +1398,267 @@ async def mass_cleanup(callback: CallbackQuery):
             await db.execute("DELETE FROM users WHERE last_seen < datetime('now', '-30 days')")
         await db.commit()
     await callback.message.answer("✅ Неактивные удалены.", reply_markup=kb_admin(callback.from_user.id))
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data == "mass:export")
 async def mass_export(callback: CallbackQuery, bot: Bot):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
-    await safe_answer(callback, "⏳ Готовлю файл…")
+    if not is_superadmin(callback.from_user.id):
+        return await callback.answer("Только для суперадмина.", show_alert=True)
+    await callback.answer("⏳ Формирую CSV…")
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users") as cur: rows = await cur.fetchall()
-    buf = io.StringIO()
-    buf.write("\ufeff")
-    writer = csv.writer(buf)
-    writer.writerow(["user_id", "username", "first_name", "joined_at", "last_seen"])
-    for r in rows: writer.writerow([r["user_id"], r["username"] or "", r["first_name"] or "", r["joined_at"] or "", r["last_seen"] or ""])
-    file = BufferedInputFile(buf.getvalue().encode("utf-8"), filename="users.csv")
-    await bot.send_document(callback.from_user.id, file, caption=f"📥 Экспорт {len(rows)} пользователей")
+        async with db.execute("""
+            SELECT u.user_id,u.username,u.first_name,u.joined_at,u.last_seen,
+                   (SELECT COUNT(*) FROM user_events e WHERE e.user_id=u.user_id AND e.event_type='download') downloads,
+                   (SELECT COUNT(*) FROM user_events e WHERE e.user_id=u.user_id) actions_count,
+                   CASE WHEN b.user_id IS NULL THEN 'active' ELSE 'banned' END status,
+                   b.reason ban_reason,b.banned_at,b.expires_at
+            FROM users u LEFT JOIN banned_users b ON b.user_id=u.user_id
+            ORDER BY u.joined_at DESC,u.user_id
+        """) as cur:
+            rows = await cur.fetchall()
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(["telegram_id","username","first_name","registered_at","last_seen","downloads","actions_count","status","ban_reason","banned_at","ban_expires_at"])
+    for r in rows:
+        writer.writerow([r["user_id"],r["username"] or "",r["first_name"] or "",r["joined_at"] or "",
+                         r["last_seen"] or "",r["downloads"],r["actions_count"],r["status"],
+                         r["ban_reason"] or "",r["banned_at"] or "",r["expires_at"] or ""])
+    document = BufferedInputFile(("\\ufeff"+buf.getvalue()).encode("utf-8"), filename="black_russia_users.csv")
+    await callback.message.answer_document(document, caption=f"📥 Экспорт готов: {len(rows)} пользователей. CSV для Excel.")
+
+
+async def audit_admin(admin_id, action, target_id=None, details=""):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO admin_actions(admin_id,action,target_user_id,details) VALUES(?,?,?,?)",(admin_id,action,target_id,details))
+        await db.commit()
+
+async def fetch_users(offset=0, search=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory=aiosqlite.Row
+        if search:
+            q="%"+search.lstrip("@").lower()+"%"
+            sql="SELECT * FROM users WHERE CAST(user_id AS TEXT) LIKE ? OR LOWER(COALESCE(username,'')) LIKE ? OR LOWER(COALESCE(first_name,'')) LIKE ? ORDER BY last_seen DESC LIMIT 12 OFFSET ?"
+            args=(q,q,q,offset)
+            count_sql="SELECT COUNT(*) FROM users WHERE CAST(user_id AS TEXT) LIKE ? OR LOWER(COALESCE(username,'')) LIKE ? OR LOWER(COALESCE(first_name,'')) LIKE ?"
+            count_args=(q,q,q)
+        else:
+            sql="SELECT * FROM users ORDER BY last_seen DESC LIMIT 12 OFFSET ?"; args=(offset,)
+            count_sql="SELECT COUNT(*) FROM users"; count_args=()
+        async with db.execute(sql,args) as cur: rows=await cur.fetchall()
+        async with db.execute(count_sql,count_args) as cur: total=(await cur.fetchone())[0]
+    return rows,total
+
+def users_markup(rows,offset,total):
+    kb=[]
+    for u in rows:
+        nm=(u["first_name"] or "Без имени")[:22]
+        un=(" @"+u["username"]) if u["username"] else ""
+        kb.append([InlineKeyboardButton(text=f"👤 {nm}{un} · {u['user_id']}"[:60],callback_data=f"ux:profile:{u['user_id']}")])
+    nav=[]
+    if offset: nav.append(InlineKeyboardButton(text="⬅️",callback_data=f"ux:list:{max(0,offset-12)}"))
+    if offset+12<total: nav.append(InlineKeyboardButton(text="➡️",callback_data=f"ux:list:{offset+12}"))
+    if nav: kb.append(nav)
+    kb += [[InlineKeyboardButton(text="🔎 Поиск",callback_data="ux:search")],[InlineKeyboardButton(text="⬅️ Назад",callback_data="adm:users")]]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+@router.callback_query(F.data=="ux:dashboard")
+async def pro_dashboard(c:CallbackQuery):
+    if not is_superadmin(c.from_user.id): return await c.answer("Нет доступа",show_alert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async def n(sql):
+            async with db.execute(sql) as cur: return (await cur.fetchone())[0]
+        total=await n("SELECT COUNT(*) FROM users")
+        active=await n("SELECT COUNT(*) FROM users WHERE last_seen>=datetime('now','-1 day')")
+        new24=await n("SELECT COUNT(*) FROM users WHERE joined_at>=datetime('now','-1 day')")
+        new7=await n("SELECT COUNT(*) FROM users WHERE joined_at>=datetime('now','-7 days')")
+        new30=await n("SELECT COUNT(*) FROM users WHERE joined_at>=datetime('now','-30 days')")
+        bans=await n("SELECT COUNT(*) FROM banned_users")
+        all_dl=await n("SELECT COUNT(*) FROM user_events WHERE event_type='download'")
+        d24=await n("SELECT COUNT(*) FROM user_events WHERE event_type='download' AND created_at>=datetime('now','-1 day')")
+        d7=await n("SELECT COUNT(*) FROM user_events WHERE event_type='download' AND created_at>=datetime('now','-7 days')")
+        d30=await n("SELECT COUNT(*) FROM user_events WHERE event_type='download' AND created_at>=datetime('now','-30 days')")
+        async with db.execute("SELECT details,COUNT(*) n FROM user_events WHERE event_type='download' GROUP BY item_id ORDER BY n DESC LIMIT 5") as cur: top=await cur.fetchall()
+    popular="\n".join(f"• {escape(r['details'] or 'Материал')}: {r['n']}" for r in top) or "Пока нет статистики"
+    msg=(f"📊 <b>Дашборд</b>\n\n👥 Всего: <b>{total}</b>\n🟢 Активные 24ч: <b>{active}</b>\n"
+         f"🆕 Новые: 24ч — {new24} · 7д — {new7} · 30д — {new30}\n"
+         f"📥 Скачивания: всего {all_dl} · 24ч {d24} · 7д {d7} · 30д {d30}\n🚫 Баны: <b>{bans}</b>\n\n🔥 <b>Популярные материалы</b>\n{popular}")
+    await c.message.answer(msg,reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📈 Подробная аналитика",callback_data="ux:analytics")],
+        [InlineKeyboardButton(text="👥 Пользователи",callback_data="ux:list:0")],
+        [InlineKeyboardButton(text="⬅️ Назад",callback_data="adm:users")]]))
+    await c.answer()
+
+@router.callback_query(F.data=="ux:analytics")
+async def pro_analytics(c:CallbackQuery):
+    if not is_superadmin(c.from_user.id): return await c.answer("Нет доступа",show_alert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        lines=[]
+        for label,period in [("24ч","1 day"),("7д","7 days"),("30д","30 days")]:
+            async with db.execute(f"SELECT COUNT(*) FROM users WHERE last_seen>=datetime('now','-{period}')") as cur: active=(await cur.fetchone())[0]
+            async with db.execute(f"SELECT COUNT(*) FROM users WHERE joined_at>=datetime('now','-{period}')") as cur: new=(await cur.fetchone())[0]
+            async with db.execute(f"SELECT COUNT(*) FROM user_events WHERE event_type='download' AND created_at>=datetime('now','-{period}')") as cur: dl=(await cur.fetchone())[0]
+            lines.append(f"• <b>{label}</b>: активность {active}, прирост +{new}, скачивания {dl}")
+        async with db.execute("SELECT details,COUNT(*) n FROM user_events WHERE event_type='download' GROUP BY item_id ORDER BY n DESC LIMIT 10") as cur: top=await cur.fetchall()
+    msg="📈 <b>Аналитика</b>\n\n"+"\n".join(lines)+"\n\n🔥 <b>Топ материалов</b>\n"
+    msg+="\n".join(f"{i+1}. {escape(r['details'] or 'Материал')} — {r['n']}" for i,r in enumerate(top)) or "Нет скачиваний"
+    await c.message.answer(msg,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Дашборд",callback_data="ux:dashboard")]]))
+    await c.answer()
+
+@router.callback_query(F.data=="ux:search")
+async def pro_search_start(c:CallbackQuery,state:FSMContext):
+    if not is_superadmin(c.from_user.id): return await c.answer("Нет доступа",show_alert=True)
+    await state.clear(); await state.set_state(UserManagement.search)
+    await c.message.answer("🔎 Введи @username, Telegram ID или часть имени:")
+    await c.answer()
+
+@router.message(UserManagement.search)
+async def pro_search_finish(m:Message,state:FSMContext):
+    if not is_superadmin(m.from_user.id): return await state.clear()
+    q=(m.text or "").strip()
+    if not q: return await m.answer("Запрос пуст.")
+    rows,total=await fetch_users(0,q); await state.clear()
+    if not rows: return await m.answer("Ничего не найдено.")
+    # Search results use profile buttons; search again for more results if needed.
+    kb=[[InlineKeyboardButton(text=f"{(u['first_name'] or 'Без имени')[:20]} @{u['username'] or '—'} · {u['user_id']}"[:60],callback_data=f"ux:profile:{u['user_id']}")] for u in rows]
+    kb.append([InlineKeyboardButton(text="🔎 Новый поиск",callback_data="ux:search")])
+    await m.answer(f"Найдено: {total}. Показаны первые {len(rows)}.",reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@router.callback_query(F.data.startswith("ux:list:"))
+async def pro_user_list(c:CallbackQuery):
+    if not is_superadmin(c.from_user.id): return await c.answer("Нет доступа",show_alert=True)
+    off=int(c.data.rsplit(":",1)[1]); rows,total=await fetch_users(off)
+    await c.message.answer(f"👥 <b>Пользователи</b> · всего {total} · страница {off//12+1}",reply_markup=users_markup(rows,off,total))
+    await c.answer()
+
+@router.callback_query(F.data.startswith("ux:profile:"))
+async def pro_user_profile(c:CallbackQuery):
+    if not is_superadmin(c.from_user.id): return await c.answer("Нет доступа",show_alert=True)
+    uid=int(c.data.rsplit(":",1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE user_id=?",(uid,)) as cur: u=await cur.fetchone()
+        if not u: return await c.answer("Пользователь не найден",show_alert=True)
+        async with db.execute("SELECT COUNT(*) FROM user_events WHERE user_id=? AND event_type='download'",(uid,)) as cur: dl=(await cur.fetchone())[0]
+        async with db.execute("SELECT * FROM banned_users WHERE user_id=?",(uid,)) as cur: ban=await cur.fetchone()
+        async with db.execute("SELECT event_type,details,created_at FROM user_events WHERE user_id=? ORDER BY id DESC LIMIT 7",(uid,)) as cur: ev=await cur.fetchall()
+    hist="\n".join(f"• {r['created_at']} {r['event_type']}: {escape(r['details'] or '')}" for r in ev) or "Нет записей"
+    msg=(f"👤 <b>Карточка пользователя</b>\nИмя: {escape(u['first_name'] or '—')}\nUsername: @{escape(u['username'] or '—')}\n"
+         f"ID: <code>{uid}</code>\nРегистрация: {u['joined_at'] or '—'}\nАктивность: {u['last_seen'] or '—'}\n"
+         f"Скачивания: <b>{dl}</b>\nСтатус: {'🚫 Бан' if ban else '🟢 Активен'}")
+    if ban: msg+=f"\nПричина: {escape(ban['reason'] or '—')}\nДо: {ban['expires_at'] or 'навсегда'}"
+    msg+="\n\n📜 <b>История действий</b>\n"+hist
+    buttons=[[InlineKeyboardButton(text="✅ Разбанить" if ban else "🚫 Бан навсегда",callback_data=f"user_unban:{uid}" if ban else f"user_ban:{uid}")]]
+    if not ban: buttons.append([InlineKeyboardButton(text="⏳ Бан на срок",callback_data=f"ux:tempban:{uid}")])
+    buttons.append([InlineKeyboardButton(text="🕘 Полная история действий",callback_data=f"ux:history:{uid}:0")])
+    buttons.append([InlineKeyboardButton(text="⬅️ К пользователям",callback_data="ux:list:0")])
+    await c.message.answer(msg,reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)); await c.answer()
+
+@router.callback_query(F.data.startswith("ux:history:"))
+async def pro_user_history(c: CallbackQuery):
+    if not is_superadmin(c.from_user.id):
+        return await c.answer("Нет доступа", show_alert=True)
+    try:
+        _, _, uid_s, off_s = c.data.split(":")
+        uid, off = int(uid_s), max(0, int(off_s))
+    except (ValueError, TypeError):
+        return await c.answer("Некорректный запрос", show_alert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT event_type,details,created_at FROM user_events WHERE user_id=? ORDER BY id DESC LIMIT 20 OFFSET ?", (uid, off)) as cur:
+            events = await cur.fetchall()
+        async with db.execute("SELECT COUNT(*) FROM user_events WHERE user_id=?", (uid,)) as cur:
+            total = (await cur.fetchone())[0]
+    lines = [f"🕘 <b>История действий · ID {uid}</b>", f"Всего записей: {total}"]
+    lines.extend(f"• {escape(e['created_at'] or '')} — {escape(e['details'] or e['event_type'])}" for e in events)
+    if not events: lines.append("История пока пуста. Новые действия будут записываться.")
+    nav = []
+    if off: nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"ux:history:{uid}:{max(0,off-20)}"))
+    if off + 20 < total: nav.append(InlineKeyboardButton(text="➡️", callback_data=f"ux:history:{uid}:{off+20}"))
+    kb = ([nav] if nav else []) + [[InlineKeyboardButton(text="👤 К профилю", callback_data=f"ux:profile:{uid}")]]
+    await c.message.answer("\\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("ux:banned:"))
+async def pro_banned(c:CallbackQuery):
+    if not is_superadmin(c.from_user.id): return await c.answer("Нет доступа",show_alert=True)
+    off=int(c.data.rsplit(":",1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT b.*,u.username,u.first_name FROM banned_users b LEFT JOIN users u ON u.user_id=b.user_id ORDER BY b.banned_at DESC LIMIT 12 OFFSET ?",(off,)) as cur: rows=await cur.fetchall()
+        async with db.execute("SELECT COUNT(*) FROM banned_users") as cur: total=(await cur.fetchone())[0]
+    lines=["⛔ <b>Забаненные</b>"]; kb=[]
+    for r in rows:
+        lines.append(f"\n• {escape(r['first_name'] or '—')} @{escape(r['username'] or '—')} · <code>{r['user_id']}</code>\nПричина: {escape(r['reason'] or '—')}\nДата: {r['banned_at']} · срок: {r['expires_at'] or 'навсегда'}")
+        kb.append([InlineKeyboardButton(text=f"🔓 Разбанить {r['user_id']}",callback_data=f"user_unban:{r['user_id']}")])
+    nav=[]
+    if off: nav.append(InlineKeyboardButton(text="⬅️",callback_data=f"ux:banned:{max(0,off-12)}"))
+    if off+12<total: nav.append(InlineKeyboardButton(text="➡️",callback_data=f"ux:banned:{off+12}"))
+    if nav: kb.append(nav)
+    kb.append([InlineKeyboardButton(text="⬅️ Пользователи",callback_data="adm:users")])
+    await c.message.answer("\n".join(lines),reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)); await c.answer()
+
+@router.callback_query(F.data=="ux:unban")
+async def pro_unban_start(c:CallbackQuery,state:FSMContext):
+    if not is_superadmin(c.from_user.id): return await c.answer("Нет доступа",show_alert=True)
+    await state.clear(); await state.set_state(UserManagement.unban_id)
+    await c.message.answer("Введи Telegram ID или @username для разблокировки:"); await c.answer()
+
+@router.callback_query(F.data=="ux:logs")
+async def pro_logs(c:CallbackQuery):
+    if not is_superadmin(c.from_user.id): return await c.answer("Нет доступа",show_alert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT * FROM admin_actions ORDER BY id DESC LIMIT 15") as cur: acts=await cur.fetchall()
+        async with db.execute("SELECT * FROM ban_history ORDER BY id DESC LIMIT 15") as cur: bans=await cur.fetchall()
+    msg="📜 <b>Действия администраторов</b>\n"+"\n".join(f"• {r['created_at']} · админ {r['admin_id']} · {r['action']} · ID {r['target_user_id'] or '—'} · {escape(r['details'] or '')}" for r in acts)
+    msg+="\n\n🚫 <b>История банов</b>\n"+"\n".join(f"• {r['created_at']} · {r['action']} · ID {r['user_id']} · админ {r['admin_id']} · {escape(r['reason'] or '')}" for r in bans)
+    await c.message.answer(msg,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Пользователи",callback_data="adm:users")]])); await c.answer()
+
+
+@router.callback_query(F.data.startswith("ux:tempban:"))
+async def tempban_start(c:CallbackQuery,state:FSMContext):
+    if not is_superadmin(c.from_user.id): return await c.answer("Нет доступа",show_alert=True)
+    uid=int(c.data.rsplit(":",1)[1])
+    if is_admin(uid): return await c.answer("Нельзя забанить администратора",show_alert=True)
+    await state.clear(); await state.update_data(tempban_user=uid)
+    await state.set_state(UserManagement.ban_reason)
+    await c.message.answer("Укажи причину бана (или /skip):")
+    await c.answer()
+
+@router.message(UserManagement.ban_reason)
+async def tempban_reason(m:Message,state:FSMContext):
+    if not is_superadmin(m.from_user.id): return await state.clear()
+    await state.update_data(tempban_reason="" if (m.text or "").strip()=="/skip" else (m.text or "").strip())
+    await state.set_state(UserManagement.ban_duration)
+    await m.answer("Срок бана: введи число дней (например, 7) или 0 для вечного бана.")
+
+@router.message(UserManagement.ban_duration)
+async def tempban_finish(m:Message,state:FSMContext,bot:Bot):
+    if not is_superadmin(m.from_user.id): return await state.clear()
+    try: days=int((m.text or "").strip())
+    except: return await m.answer("Введи целое число дней или 0.")
+    if days<0 or days>36500: return await m.answer("Срок должен быть от 0 до 36500 дней.")
+    data=await state.get_data(); uid=data["tempban_user"]; reason=data.get("tempban_reason","")
+    expires_expr=None if days==0 else f"+{days} days"
+    async with aiosqlite.connect(DB_PATH) as db:
+        if days:
+            await db.execute("INSERT INTO banned_users(user_id,reason,banned_by,expires_at) VALUES(?,?,?,datetime('now',?)) ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason,banned_by=excluded.banned_by,banned_at=CURRENT_TIMESTAMP,expires_at=excluded.expires_at",(uid,reason,m.from_user.id,expires_expr))
+        else:
+            await db.execute("INSERT INTO banned_users(user_id,reason,banned_by,expires_at) VALUES(?,?,?,NULL) ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason,banned_by=excluded.banned_by,banned_at=CURRENT_TIMESTAMP,expires_at=NULL",(uid,reason,m.from_user.id))
+        await db.execute("INSERT INTO ban_history(user_id,admin_id,action,reason,expires_at) VALUES(?,?, 'ban',?,?)",(uid,m.from_user.id,reason,None if not days else f"{days} days"))
+        await db.execute("INSERT INTO admin_actions(admin_id,action,target_user_id,details) VALUES(?,?,?,?)",(m.from_user.id,"ban",uid,"навсегда" if days==0 else f"{days} дней; {reason}"))
+        await db.commit()
+    try: await bot.send_message(uid,"⛔ Доступ к боту ограничен."+ (f" Причина: {escape(reason)}" if reason else "") + (f" Срок: {days} дн." if days else " Бан бессрочный."))
+    except: pass
+    await state.clear()
+    await m.answer("🚫 Бан применён: "+("навсегда." if days==0 else f"на {days} дн."),reply_markup=kb_admin(m.from_user.id))
 
 # ---------- Администраторы ----------
 @router.callback_query(F.data == "adm:admins")
 async def admins_menu(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     lines = ["🔑 <b>Администраторы</b>\n\nИз .env:"]
     for uid in ADMIN_IDS: lines.append(f"👑 <code>{uid}</code> — superadmin")
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1377,15 +1671,15 @@ async def admins_menu(callback: CallbackQuery):
     for a in db_admins: buttons.append([InlineKeyboardButton(text=f"🗑 Удалить {a['user_id']}", callback_data=f"adm:admin_remove:{a['user_id']}")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:open")])
     await callback.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data == "adm:admin_add")
 async def admin_add_id(callback: CallbackQuery, state: FSMContext):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     await state.clear()
     await state.set_state(ManageAdmins.add_id)
     await callback.message.answer("Введи ID нового админа.")
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.message(ManageAdmins.add_id)
 async def admin_add_role(message: Message, state: FSMContext):
@@ -1402,7 +1696,7 @@ async def admin_add_role(message: Message, state: FSMContext):
 
 @router.callback_query(ManageAdmins.add_role, F.data.startswith("admin_role:"))
 async def admin_add_role_finish(callback: CallbackQuery, state: FSMContext):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     role = callback.data.split(":")[1]
     target_id = (await state.get_data()).get("new_admin_id")
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1411,24 +1705,24 @@ async def admin_add_role_finish(callback: CallbackQuery, state: FSMContext):
     await load_admins()
     await state.clear()
     await callback.message.answer(f"✅ <code>{target_id}</code> теперь {role}.", reply_markup=kb_admin(callback.from_user.id))
-    await safe_answer(callback)
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("adm:admin_remove:"))
 async def admin_remove(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_superadmin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     target_id = int(callback.data.split(":")[2])
-    if target_id in ADMIN_IDS: return await safe_answer(callback, "Нельзя удалить из .env.", show_alert=True)
+    if target_id in ADMIN_IDS: return await callback.answer("Нельзя удалить из .env.", show_alert=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM admins WHERE user_id=?", (target_id,))
         await db.commit()
     await load_admins()
-    await safe_answer(callback, "Удалён.")
+    await callback.answer("Удалён.")
     await admins_menu(callback)
 
 # ---------- Статистика ----------
 @router.callback_query(F.data == "adm:stats")
 async def stats(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id): return await safe_answer(callback, "Ошибка.", show_alert=True)
+    if not is_admin(callback.from_user.id): return await callback.answer("Ошибка.", show_alert=True)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM users") as cur: users = (await cur.fetchone())[0]
         async with db.execute("SELECT COUNT(*) FROM items WHERE kind='macro'") as cur: macros = (await cur.fetchone())[0]
@@ -1440,9 +1734,8 @@ async def stats(callback: CallbackQuery):
         f"📊 Статистика\nПользователей: {users}\n📝 Макросов: {macros}\n📱 Приложений: {apps}\n🎥 Туториалов: {tutorials}\n⛔ Забанено: {banned}\nАктивных каналов: {channels}",
         reply_markup=kb_admin(callback.from_user.id),
     )
-    await safe_answer(callback)
+    await callback.answer()
 
-# ---------- ЗАПУСК ----------
 async def main():
     await init_db()
     await load_admins()
@@ -1451,21 +1744,6 @@ async def main():
     router.message.outer_middleware(BanMiddleware())
     router.callback_query.outer_middleware(BanMiddleware())
     dp.include_router(router)
-    
-    # --- ДОБАВЛЕНО: Веб-сервер для Render (чтобы не было ошибки No open ports) ---
-    async def handle(request):
-        return web.Response(text="Bot is running!")
-    
-    app = web.Application()
-    app.router.add_get("/", handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"Web server started on port {port}")
-    # -------------------------------------------------------------------------
-
     print("Bot started. Stop with Ctrl+C.")
     try:
         await dp.start_polling(bot)
